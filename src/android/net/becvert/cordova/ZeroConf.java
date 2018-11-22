@@ -18,6 +18,7 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.IOException;
+import java.io.UnsupportedEncodingException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.net.Inet4Address;
@@ -33,10 +34,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 
-import javax.jmdns.JmDNS;
-import javax.jmdns.ServiceEvent;
-import javax.jmdns.ServiceInfo;
-import javax.jmdns.ServiceListener;
+import android.net.nsd.NsdServiceInfo;
+import android.net.nsd.NsdManager;
 
 import static android.content.Context.WIFI_SERVICE;
 
@@ -44,14 +43,152 @@ public class ZeroConf extends CordovaPlugin {
 
     private static final String TAG = "ZeroConf";
 
-    WifiManager.MulticastLock lock;
-
-    private RegistrationManager registrationManager;
-    private BrowserManager browserManager;
-    private List<InetAddress> addresses;
-    private List<InetAddress> ipv6Addresses;
-    private List<InetAddress> ipv4Addresses;
+    private NsdManager _nsdManager;
     private String hostname;
+
+    private class ServiceIdentifier {
+      private String _domain, _name, _type;
+
+      public ServiceIdentifier(String domain, String name, String type) {
+        _domain = domain;
+        _name = name;
+        _type = type;
+      }
+
+      public boolean equals(ServiceIdentifier other) {
+        return (other._domain == _domain) && (other._name == _name) && (other._type == _type);
+      }
+
+      public int hashCode() {
+        return (_domain + _name + _type).hashCode();
+      }
+    }
+
+    private class ServiceListener implements NsdManager.RegistrationListener {
+      private CallbackContext _callback;
+
+      public void setCallback(final CallbackContext cb) {
+        _callback = cb;
+      }
+
+      @Override
+      public void onServiceRegistered(NsdServiceInfo service) {
+
+        try {
+
+          JSONObject status = new JSONObject();
+          status.put("action", "registered");
+          status.put("service", service.getServiceName());
+
+          Log.d(TAG, "Sending result: " + status.toString());
+
+          PluginResult result = new PluginResult(PluginResult.Status.OK, status);
+
+          if (_callback != null)
+            _callback.sendPluginResult(result);
+        } catch (JSONException e) {
+            Log.e(TAG, e.getMessage(), e);
+
+            if (_callback != null)
+              _callback.error("Error: " + e.getMessage());
+        }
+      }
+
+      @Override
+      public void onRegistrationFailed(NsdServiceInfo serviceInfo, int errorCode) {
+        if (_callback != null)
+          _callback.error("Failed to register");
+        return;
+      }
+
+      @Override
+      public void onServiceUnregistered(NsdServiceInfo serviceInfo) {
+        if (_callback != null)
+          _callback.success();
+      }
+
+      @Override
+      public void onUnregistrationFailed(NsdServiceInfo serviceInfo, int errorCode) {
+        if (_callback != null)
+          _callback.error("Failed to unregister");
+      }
+    }
+
+    private class WatchListener implements NsdManager.DiscoveryListener {
+      private CallbackContext _callback, _eventCallback;
+
+      public WatchListener(CallbackContext eventCallback) {
+        _eventCallback = eventCallback;
+      }
+
+      private void sendCallback(String action, NsdServiceInfo service) {
+          JSONObject status = new JSONObject();
+          try {
+              status.put("action", action);
+              status.put("service", jsonifyService(service));
+
+              Log.d(TAG, "Sending result: " + status.toString());
+
+              PluginResult result = new PluginResult(PluginResult.Status.OK, status);
+              result.setKeepCallback(true);
+              _eventCallback.sendPluginResult(result);
+
+          } catch (JSONException e) {
+              Log.e(TAG, e.getMessage(), e);
+              _eventCallback.error("Error: " + e.getMessage());
+          }
+      }
+
+      @Override
+      public void onDiscoveryStarted(String regType) {
+          Log.d(TAG, "Service discovery started");
+      }
+
+      @Override
+      public void onServiceFound(NsdServiceInfo service) {
+          Log.d(TAG, "Added");
+          _nsdManager.resolveService(service, new NsdManager.ResolveListener() {
+              @Override
+              public void onServiceResolved(NsdServiceInfo service) {
+                  Log.d(TAG, "Resolved");
+
+                  sendCallback("resolved", service);
+              }
+
+              @Override
+              public void onResolveFailed(NsdServiceInfo serviceInfo, int errorCode) {
+                  Log.i(TAG, "Resolve failed: " + serviceInfo.getServiceName() + errorCode);
+              }
+          });
+          sendCallback("added", service);
+      }
+
+      @Override
+      public void onServiceLost(NsdServiceInfo service) {
+          Log.d(TAG, "Removed");
+          sendCallback("removed", service);
+      }
+
+      @Override
+      public void onDiscoveryStopped(String serviceType) {
+          Log.i(TAG, "Discovery stopped: " + serviceType);
+      }
+
+      @Override
+      public void onStartDiscoveryFailed(String serviceType, int errorCode) {
+          Log.e(TAG, "Discovery failed: Error code:" + errorCode);
+          _nsdManager.stopServiceDiscovery(this);
+      }
+
+      @Override
+      public void onStopDiscoveryFailed(String serviceType, int errorCode) {
+          Log.e(TAG, "Discovery failed: Error code:" + errorCode);
+          _nsdManager.stopServiceDiscovery(this);
+      }
+    }
+
+    private Map<ServiceIdentifier, ServiceListener> registeredServices = new HashMap<ServiceIdentifier, ServiceListener>();
+    private Map<ServiceIdentifier, WatchListener> registeredWatches = new HashMap<ServiceIdentifier, WatchListener>();
 
     public static final String ACTION_GET_HOSTNAME = "getHostname";
     // publisher
@@ -71,35 +208,7 @@ public class ZeroConf extends CordovaPlugin {
 
         Context context = this.cordova.getActivity().getApplicationContext();
         WifiManager wifi = (WifiManager) context.getSystemService(WIFI_SERVICE);
-        lock = wifi.createMulticastLock("ZeroConfPluginLock");
-        lock.setReferenceCounted(false);
-
-        try {
-            addresses = new CopyOnWriteArrayList<InetAddress>();
-            ipv6Addresses = new CopyOnWriteArrayList<InetAddress>();
-            ipv4Addresses = new CopyOnWriteArrayList<InetAddress>();
-            List<NetworkInterface> intfs = Collections.list(NetworkInterface.getNetworkInterfaces());
-            for (NetworkInterface intf : intfs) {
-                if (intf.supportsMulticast()) {
-                    List<InetAddress> addrs = Collections.list(intf.getInetAddresses());
-                    for (InetAddress addr : addrs) {
-                        if (!addr.isLoopbackAddress()) {
-                            if (addr instanceof Inet6Address) {
-                                addresses.add(addr);
-                                ipv6Addresses.add(addr);
-                            } else if (addr instanceof Inet4Address) {
-                                addresses.add(addr);
-                                ipv4Addresses.add(addr);
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (Exception e) {
-            Log.e(TAG, e.getMessage(), e);
-        }
-
-        Log.d(TAG, "Addresses " + addresses);
+        _nsdManager = (NsdManager) context.getSystemService(Context.NSD_SERVICE);
 
         try {
             hostname = getHostName(cordova);
@@ -115,28 +224,8 @@ public class ZeroConf extends CordovaPlugin {
     @Override
     public void onDestroy() {
         super.onDestroy();
-        if (registrationManager != null) {
-            try {
-                registrationManager.stop();
-            } catch (IOException e) {
-                Log.e(TAG, e.getMessage(), e);
-            } finally {
-                registrationManager = null;
-            }
-        }
-        if (browserManager != null) {
-            try {
-                browserManager.close();
-            } catch (IOException e) {
-                Log.e(TAG, e.getMessage(), e);
-            } finally {
-                browserManager = null;
-            }
-        }
-        if (lock != null) {
-            lock.release();
-            lock = null;
-        }
+        // TODO need to stop all watchers
+        // TODO need to stop all services
 
         Log.v(TAG, "Destroyed");
     }
@@ -158,6 +247,7 @@ public class ZeroConf extends CordovaPlugin {
             }
 
         } else if (ACTION_REGISTER.equals(action)) {
+            NsdServiceInfo serviceInfo = new NsdServiceInfo();
 
             final String type = args.optString(0);
             final String domain = args.optString(1);
@@ -166,43 +256,22 @@ public class ZeroConf extends CordovaPlugin {
             final JSONObject props = args.optJSONObject(4);
             final String addressFamily = args.optString(5);
 
+            serviceInfo.setServiceType(type);
+            serviceInfo.setServiceName(name);
+            serviceInfo.setPort(port);
+
             Log.d(TAG, "Register " + type + domain);
 
             cordova.getThreadPool().execute(new Runnable() {
                 @Override
                 public void run() {
                     try {
-                        if (registrationManager == null) {
-                            List<InetAddress> selectedAddresses = addresses;
-                            if ("ipv6".equalsIgnoreCase(addressFamily)) {
-                                selectedAddresses = ipv6Addresses;
-                            } else if ("ipv4".equalsIgnoreCase(addressFamily)) {
-                                selectedAddresses = ipv4Addresses;
-                            }
-                            registrationManager = new RegistrationManager(selectedAddresses, hostname);
-                        }
+                        ServiceListener listener = new ServiceListener();
+                        listener.setCallback(callbackContext);
 
-                        ServiceInfo service = registrationManager.register(type, domain, name, port, props);
-                        if (service == null) {
-                            callbackContext.error("Failed to register");
-                            return;
-                        }
+                        _nsdManager.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, listener);
+                        registeredServices.put(new ServiceIdentifier(type, domain, name), listener);
 
-                        JSONObject status = new JSONObject();
-                        status.put("action", "registered");
-                        status.put("service", jsonifyService(service));
-
-                        Log.d(TAG, "Sending result: " + status.toString());
-
-                        PluginResult result = new PluginResult(PluginResult.Status.OK, status);
-                        callbackContext.sendPluginResult(result);
-
-                    } catch (JSONException e) {
-                        Log.e(TAG, e.getMessage(), e);
-                        callbackContext.error("Error: " + e.getMessage());
-                    } catch (IOException e) {
-                        Log.e(TAG, e.getMessage(), e);
-                        callbackContext.error("Error: " + e.getMessage());
                     } catch (RuntimeException e) {
                         Log.e(TAG, e.getMessage(), e);
                         callbackContext.error("Error: " + e.getMessage());
@@ -216,45 +285,38 @@ public class ZeroConf extends CordovaPlugin {
             final String domain = args.optString(1);
             final String name = args.optString(2);
 
-            Log.d(TAG, "Unregister " + type + domain);
+            cordova.getThreadPool().execute(new Runnable() {
 
-            if (registrationManager != null) {
-                final RegistrationManager rm = registrationManager;
-                cordova.getThreadPool().execute(new Runnable() {
+                @Override
+                public void run() {
 
-                    @Override
-                    public void run() {
-                        rm.unregister(type, domain, name);
-                        callbackContext.success();
-                    }
-                });
-            } else {
-                callbackContext.success();
-            }
+                    Log.d(TAG, "Unregister " + type + domain);
+
+                    ServiceListener listener = registeredServices.remove(new ServiceIdentifier(type, domain, name));
+                    listener.setCallback(callbackContext);
+                    _nsdManager.unregisterService(listener);
+
+                    callbackContext.success();
+                }
+            });
 
         } else if (ACTION_STOP.equals(action)) {
 
             Log.d(TAG, "Stop");
 
-            if (registrationManager != null) {
-                final RegistrationManager rm = registrationManager;
-                registrationManager = null;
-                cordova.getThreadPool().execute(new Runnable() {
-                    @Override
-                    public void run() {
-                        try {
-                            rm.stop();
-                            callbackContext.success();
-
-                        } catch (IOException e) {
-                            Log.e(TAG, e.getMessage(), e);
-                            callbackContext.error("Error: " + e.getMessage());
-                        }
+            cordova.getThreadPool().execute(new Runnable() {
+                @Override
+                public void run() {
+                    Iterator<ServiceIdentifier> iter = registeredServices.keySet().iterator();
+                    while (iter.hasNext()) {
+                      ServiceListener listener = registeredServices.remove(iter.next());
+                      listener.setCallback(null);
+                      _nsdManager.unregisterService(listener);
                     }
-                });
-            } else {
-                callbackContext.success();
-            }
+
+                    callbackContext.success();
+                }
+            });
 
         } else if (ACTION_WATCH.equals(action)) {
 
@@ -269,21 +331,11 @@ public class ZeroConf extends CordovaPlugin {
                 @Override
                 public void run() {
                     try {
-                        if (browserManager == null) {
-                            List<InetAddress> selectedAddresses = addresses;
-                            if ("ipv6".equalsIgnoreCase(addressFamily)) {
-                                selectedAddresses = ipv6Addresses;
-                            } else if ("ipv4".equalsIgnoreCase(addressFamily)) {
-                                selectedAddresses = ipv4Addresses;
-                            }
-                            browserManager = new BrowserManager(selectedAddresses, hostname);
-                        }
+                        WatchListener listener = new WatchListener(callbackContext);
+                        _nsdManager.discoverServices(type, NsdManager.PROTOCOL_DNS_SD, listener);
 
-                        browserManager.watch(type, domain, callbackContext);
+                        registeredWatches.put(new ServiceIdentifier(type, domain, ""), listener);
 
-                    } catch (IOException e) {
-                        Log.e(TAG, e.getMessage(), e);
-                        callbackContext.error("Error: " + e.getMessage());
                     } catch (RuntimeException e) {
                         Log.e(TAG, e.getMessage(), e);
                         callbackContext.error("Error: " + e.getMessage());
@@ -302,43 +354,34 @@ public class ZeroConf extends CordovaPlugin {
 
             Log.d(TAG, "Unwatch " + type + domain);
 
-            if (browserManager != null) {
-                final BrowserManager bm = browserManager;
-                cordova.getThreadPool().execute(new Runnable() {
-                    @Override
-                    public void run() {
-                        bm.unwatch(type, domain);
-                        callbackContext.success();
-                    }
-                });
-            } else {
-                callbackContext.success();
-            }
+            cordova.getThreadPool().execute(new Runnable() {
+                @Override
+                public void run() {
+                    WatchListener listener = registeredWatches.remove(new ServiceIdentifier(type, domain, ""));
+                    _nsdManager.stopServiceDiscovery(listener);
+
+                    callbackContext.success();
+                }
+            });
 
         } else if (ACTION_CLOSE.equals(action)) {
 
             Log.d(TAG, "Close");
 
-            if (browserManager != null) {
-                final BrowserManager bm = browserManager;
-                browserManager = null;
-                cordova.getThreadPool().execute(new Runnable() {
+            cordova.getThreadPool().execute(new Runnable() {
 
-                    @Override
-                    public void run() {
-                        try {
-                            bm.close();
-                            callbackContext.success();
+                @Override
+                public void run() {
+                    Iterator<ServiceIdentifier> iter = registeredWatches.keySet().iterator();
 
-                        } catch (IOException e) {
-                            Log.e(TAG, e.getMessage(), e);
-                            callbackContext.error("Error: " + e.getMessage());
-                        }
+                    while (iter.hasNext()) {
+                      WatchListener listener = registeredWatches.remove(iter.next());
+                      _nsdManager.stopServiceDiscovery(listener);
                     }
-                });
-            } else {
-                callbackContext.success();
-            }
+
+                    callbackContext.success();
+                }
+            });
 
         } else if (ACTION_REINIT.equals(action)) {
             Log.e(TAG, "Re-Initializing");
@@ -363,203 +406,33 @@ public class ZeroConf extends CordovaPlugin {
         return true;
     }
 
-    private class RegistrationManager {
-
-        private List<JmDNS> publishers = new ArrayList<JmDNS>();
-
-        public RegistrationManager(List<InetAddress> addresses, String hostname) throws IOException {
-
-            if (addresses == null || addresses.size() == 0) {
-                publishers.add(JmDNS.create(null, hostname));
-            } else {
-                for (InetAddress addr : addresses) {
-                    publishers.add(JmDNS.create(addr, hostname));
-                }
-            }
-
-        }
-
-        public ServiceInfo register(String type, String domain, String name, int port, JSONObject props) throws JSONException, IOException {
-
-            HashMap<String, String> txtRecord = new HashMap<String, String>();
-            if (props != null) {
-                Iterator<String> iter = props.keys();
-                while (iter.hasNext()) {
-                    String key = iter.next();
-                    txtRecord.put(key, props.getString(key));
-                }
-            }
-
-            ServiceInfo aService = null;
-            for (JmDNS publisher : publishers) {
-                ServiceInfo service = ServiceInfo.create(type + domain, name, port, 0, 0, txtRecord);
-                try {
-                    publisher.registerService(service);
-                    aService = service;
-                } catch (IOException e) {
-                    Log.e(TAG, e.getMessage(), e);
-                }
-            }
-            // returns only one of the ServiceInfo instances!
-            return aService;
-        }
-
-        public void unregister(String type, String domain, String name) {
-
-            for (JmDNS publisher : publishers) {
-                ServiceInfo serviceInfo = publisher.getServiceInfo(type + domain, name, 5000);
-                if (serviceInfo != null) {
-                    publisher.unregisterService(serviceInfo);
-                }
-            }
-
-        }
-
-        public void stop() throws IOException {
-
-            for (JmDNS publisher : publishers) {
-                publisher.close();
-            }
-
-        }
-
-    }
-
-    private class BrowserManager implements ServiceListener {
-
-        private List<JmDNS> browsers = new ArrayList<JmDNS>();
-
-        private Map<String, CallbackContext> callbacks = new HashMap<String, CallbackContext>();
-
-        public BrowserManager(List<InetAddress> addresses, String hostname) throws IOException {
-
-            lock.acquire();
-
-            if (addresses == null || addresses.size() == 0) {
-                browsers.add(JmDNS.create(null, hostname));
-            } else {
-                for (InetAddress addr : addresses) {
-                    browsers.add(JmDNS.create(addr, hostname));
-                }
-            }
-        }
-
-        private void watch(String type, String domain, CallbackContext callbackContext) {
-
-            callbacks.put(type + domain, callbackContext);
-
-            for (JmDNS browser : browsers) {
-                browser.addServiceListener(type + domain, this);
-            }
-
-        }
-
-        private void unwatch(String type, String domain) {
-
-            callbacks.remove(type + domain);
-
-            for (JmDNS browser : browsers) {
-                browser.removeServiceListener(type + domain, this);
-            }
-
-        }
-
-        private void close() throws IOException {
-
-            lock.release();
-
-            callbacks.clear();
-
-            for (JmDNS browser : browsers) {
-                browser.close();
-            }
-
-        }
-
-        @Override
-        public void serviceResolved(ServiceEvent ev) {
-            Log.d(TAG, "Resolved");
-
-            sendCallback("resolved", ev.getInfo());
-        }
-
-        @Override
-        public void serviceRemoved(ServiceEvent ev) {
-            Log.d(TAG, "Removed");
-
-            sendCallback("removed", ev.getInfo());
-        }
-
-        @Override
-        public void serviceAdded(ServiceEvent ev) {
-            Log.d(TAG, "Added");
-
-            sendCallback("added", ev.getInfo());
-        }
-
-        public void sendCallback(String action, ServiceInfo service) {
-            CallbackContext callbackContext = callbacks.get(service.getType());
-            if (callbackContext == null) {
-                return;
-            }
-
-            JSONObject status = new JSONObject();
-            try {
-                status.put("action", action);
-                status.put("service", jsonifyService(service));
-
-                Log.d(TAG, "Sending result: " + status.toString());
-
-                PluginResult result = new PluginResult(PluginResult.Status.OK, status);
-                result.setKeepCallback(true);
-                callbackContext.sendPluginResult(result);
-
-            } catch (JSONException e) {
-                Log.e(TAG, e.getMessage(), e);
-                callbackContext.error("Error: " + e.getMessage());
-            }
-        }
-
-    }
-
-    private static JSONObject jsonifyService(ServiceInfo service) throws JSONException {
+    private static JSONObject jsonifyService(NsdServiceInfo service) throws JSONException {
         JSONObject obj = new JSONObject();
 
-        String domain = service.getDomain() + ".";
+        String domain = "local.";
         obj.put("domain", domain);
-        obj.put("type", service.getType().replace(domain, ""));
-        obj.put("name", service.getName());
+        obj.put("type", service.getServiceType().replace(domain, ""));
+        obj.put("name", service.getServiceName());
         obj.put("port", service.getPort());
-        obj.put("hostname", service.getServer());
 
-        JSONArray ipv4Addresses = new JSONArray();
-        InetAddress[] inet4Addresses = service.getInet4Addresses();
-        for (int i = 0; i < inet4Addresses.length; i++) {
-            if (inet4Addresses[i] != null) {
-                ipv4Addresses.put(inet4Addresses[i].getHostAddress());
-            }
+        if (service.getHost() != null) {
+            String[] hostComponents = service.getHost().toString().split("\\/");
+            obj.put("hostname", hostComponents[hostComponents.length - 1]);
         }
-        obj.put("ipv4Addresses", ipv4Addresses);
-
-        JSONArray ipv6Addresses = new JSONArray();
-        InetAddress[] inet6Addresses = service.getInet6Addresses();
-        for (int i = 0; i < inet6Addresses.length; i++) {
-            if (inet6Addresses[i] != null) {
-                ipv6Addresses.put(inet6Addresses[i].getHostAddress());
-            }
-        }
-        obj.put("ipv6Addresses", ipv6Addresses);
 
         JSONObject props = new JSONObject();
-        Enumeration<String> names = service.getPropertyNames();
-        while (names.hasMoreElements()) {
-            String name = names.nextElement();
-            props.put(name, service.getPropertyString(name));
+        Map<String, byte[]> attributes = service.getAttributes();
+        Iterator<String> names = attributes.keySet().iterator();
+
+        while (names.hasNext()) {
+            String name = names.next();
+            try {
+                props.put(name, new String(attributes.get(name), "UTF-8"));
+            } catch (UnsupportedEncodingException e) {}
         }
         obj.put("txtRecord", props);
 
         return obj;
-
     }
 
     // http://stackoverflow.com/questions/21898456/get-android-wifi-net-hostname-from-code

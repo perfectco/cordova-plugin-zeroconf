@@ -25,7 +25,6 @@
             </feature>
         </config-file>
         <source-file src="src/android/net/becvert/cordova/ZeroConf.java" target-dir="src/net/becvert/cordova" />
-        <framework src="org.jmdns:jmdns:3.5.4" />
     </platform>
 
     <platform name="ios">
@@ -42,7 +41,7 @@
         <header-file src="src/ios/Hostname.h"/>
         <source-file src="src/ios/Hostname.m"/>
     </platform>
-    
+
     <dependency id="cordova-plugin-add-swift-support" version="1.7.2"/>
 
 </plugin>
