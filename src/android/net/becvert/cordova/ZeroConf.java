@@ -33,6 +33,8 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.Queue;
+import java.util.ArrayDeque;
 
 import android.net.nsd.NsdServiceInfo;
 import android.net.nsd.NsdManager;
@@ -116,6 +118,36 @@ public class ZeroConf extends CordovaPlugin {
 
     private class WatchListener implements NsdManager.DiscoveryListener {
       private CallbackContext _callback, _eventCallback;
+      private Queue<NsdServiceInfo> _toBeResolved = new ArrayDeque<NsdServiceInfo>(5);
+      private NsdManager.ResolveListener _resolver = new NsdManager.ResolveListener() {
+          @Override
+          public void onServiceResolved(NsdServiceInfo service) {
+              Log.d(TAG, "Resolved");
+
+              sendCallback("resolved", service);
+          }
+
+          @Override
+          public void onResolveFailed(NsdServiceInfo serviceInfo, int errorCode) {
+              Log.i(TAG, "Resolve failed: " + serviceInfo.getServiceName() + errorCode);
+          }
+
+          private void resolveNext() {
+            cordova.getThreadPool().execute(new Runnable() {
+                @Override
+                public void run() {
+                  try {
+                    Thread.sleep(1000);
+                  } catch (InterruptedException e) {}
+
+                  NsdServiceInfo next = _toBeResolved.poll();
+                  if (next != null) {
+                    _nsdManager.resolveService(next, _resolver);
+                  }
+                }
+            });
+          }
+      };
 
       public WatchListener(CallbackContext eventCallback) {
         _eventCallback = eventCallback;
@@ -147,20 +179,12 @@ public class ZeroConf extends CordovaPlugin {
       @Override
       public void onServiceFound(NsdServiceInfo service) {
           Log.d(TAG, "Added");
-          _nsdManager.resolveService(service, new NsdManager.ResolveListener() {
-              @Override
-              public void onServiceResolved(NsdServiceInfo service) {
-                  Log.d(TAG, "Resolved");
-
-                  sendCallback("resolved", service);
-              }
-
-              @Override
-              public void onResolveFailed(NsdServiceInfo serviceInfo, int errorCode) {
-                  Log.i(TAG, "Resolve failed: " + serviceInfo.getServiceName() + errorCode);
-              }
-          });
           sendCallback("added", service);
+
+          _toBeResolved.add(service);
+          if (_toBeResolved.size() == 1) {
+            _nsdManager.resolveService(_toBeResolved.poll(), _resolver);
+          }
       }
 
       @Override
