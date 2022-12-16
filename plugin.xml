@@ -26,22 +26,4 @@
         </config-file>
         <source-file src="src/android/net/becvert/cordova/ZeroConf.java" target-dir="src/net/becvert/cordova" />
     </platform>
-
-    <platform name="ios">
-        <js-module src="www/zeroconf.js" name="ZeroConf">
-            <clobbers target="cordova.plugins.zeroconf" />
-        </js-module>
-        <config-file target="config.xml" parent="/*">
-            <feature name="ZeroConf">
-                <param name="ios-package" value="ZeroConf"/>
-            </feature>
-        </config-file>
-        <header-file src="src/ios/ZeroConf-Bridging-Header.h"/>
-        <source-file src="src/ios/ZeroConf.swift"/>
-        <header-file src="src/ios/Hostname.h"/>
-        <source-file src="src/ios/Hostname.m"/>
-    </platform>
-
-    <dependency id="cordova-plugin-add-swift-support" version="1.7.2"/>
-
 </plugin>
